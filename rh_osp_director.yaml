@@ -1,0 +1,170 @@
+  - name: Including locked vars
+    include_vars:
+      file: locked-vars.yml
+
+  - name: Running preconfiguration tasks
+    include_tasks: pre-configuration.yml
+
+  - name: Update the Undercloud
+    yum:
+      name: "*"
+      state: latest
+    register: update
+
+  - name: Create group Stack
+    group:
+      name: stack
+      state: present
+
+  - name: Create user stack
+    user:
+      name: stack
+      group: stack
+      createhome: yes
+      move_home: yes
+      home: /home/stack
+      password: "{{ stack_pass }}"
+      state: present
+
+  - name: Create images Directory
+    file:
+      path:  /home/stack/templates
+      state: directory
+      owner: stack
+      group: stack
+      mode: 0755
+      setype: user_home_t
+
+  - name: Create templates directory
+    file:
+      path: /home/stack/templates
+      state: directory
+      owner: stack
+      group: stack
+      mode: 0755
+      setype: user_home_t
+
+  - name: Create /etc/sudoers.d/stack
+    copy:
+      dest: /etc/sudoers.d/stack
+      mode: 0440
+      content: "stack ALL=(root) NOPASSWD:ALL"
+      owner: root
+      group: root
+
+  - name: Configure hostname
+    hostname:
+      name: "{{ shortname }}.{{ domainname }}"
+
+  - name: Configure /etc/hosts
+    lineinfile:
+      path: /etc/hosts
+      regexp: "{{ shortname }}"
+      state: present
+      line: "{{ ansible_default_ipv4.address }}  {{ shortname }}  {{ shortname }}.{{ domainname }}"
+
+  - name: Rebooting node
+    shell: sleep 3 && /sbin/reboot
+    async: 1
+    poll: 0
+    ignore_errors: true
+
+  - name: Waiting on node to return
+    wait_for:
+      host: "{{ ansible_ssh_host }}"
+      state: started
+      port: 22
+      delay: 30
+      timeout: 600
+      connect_timeout: 10
+    delegate_to: localhost
+
+  - name: Install Undercloud Packages
+    package:
+      name: "{{ item }}"
+      state: present
+    with_items:
+      - crudini
+      - python-tripleoclient
+      - rhosp-director-images
+      - rhosp-director-images-ipa
+      - tmux
+
+  - name: Copying Undercloud.conf
+    copy:
+      src: "{{ undercloud_conf }}"
+      dest: /home/stack/undercloud.conf
+      owner: stack
+      group: stack
+
+  - name: Check for undercloud installation
+    shell: "tail -n 12 /home/stack/.instack/install-undercloud.log | head -n 1"
+    register: install_status
+    failed_when: false
+    changed_when: false
+
+  - name: Installation of the Undercloud (It takes a long time...)
+    shell: openstack undercloud install
+    become: yes
+    become_user: stack
+    async: 14400
+    poll: 60
+    when: install_status.stdout != "Undercloud install complete"
+
+  - name: Extracting images
+    unarchive:
+      remote_src: yes
+      src: "{{ item }}"
+      dest: /home/stack/images
+      creates: overcloud-full.qcow2
+    become: yes
+    become_user: stack
+    with_items:
+      - /usr/share/rhosp-director-images/overcloud-full-latest-10.0.tar
+      - /usr/share/rhosp-director-images/ironic-python-agent-latest-10.0.tar
+
+  - name: Uploading images to glance
+    shell: "./home/stack/stackrc && openstack overcloud image upload --image-path /home/stack/images"
+    become: yes
+    become_user: stack
+
+  - name: Get pubkey
+    command: cat /home/stack/.ssh/id_rsa.pub
+    register: pubkey
+
+  - name: Inject pubkey
+    lineinfile:
+      state: present
+      create: yes
+      path: /root/.ssh/authorized_key
+      mode: 0600
+      owner: root
+      group: root
+      setype: ssh_home_t
+      line: "{{ pubkey.stdout }}"
+    delegate_to: 127.0.0.1
+
+  - name: Running instackenv.sh
+    script: "../files/{{ instackenv_sh }}"
+    args:
+      creates: /home/stack/instackenv.json
+    become: yes
+    become_user: stack
+
+  - name: Running postconfiguration tasks
+    include_tasks: post-configuration.yml
+
+  - name: Importing ironic nodes
+    shell: "source /home/stack/stackrc && openstack baremetal import --json /home/stack/instackenv.json"
+    become: yes
+    become_user: stack
+
+  - name: Configure boot
+    shell: "source /home/stack/stackrc && openstack baremetal configure boot"
+    become: yes
+    become_user: stack
+
+  - name: Beggining Introspection
+    shel: "source /home/stack/stackrc && openstack baremetal introspection bulk start"
+    become: yes
+    become_user: stack
